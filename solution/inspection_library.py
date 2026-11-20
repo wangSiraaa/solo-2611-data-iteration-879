@@ -44,6 +44,20 @@ from chainage_catalog import (
     fraction_to_db,
     merge_intervals,
 )
+from patrol_interpretation import (
+    Band,
+    ContractConflictError,
+    ContractEvaluation,
+    Interpretation,
+    PatrolContract,
+    PatrolError,
+    StepBound,
+    StepCredentialRegistry,
+    Zone,
+    classify_outcome,
+    interpret_band,
+    make_interp_key,
+)
 
 
 class InspectionError(ValueError):
@@ -198,10 +212,185 @@ class AssetsIndex:
 class InspectionLibrary:
     """Holds catalogue revisions, fixed assets and published reports."""
 
-    def __init__(self, registry: CatalogRegistry, assets: Iterable[Asset]):
+    def __init__(
+        self,
+        registry: CatalogRegistry,
+        assets: Iterable[Asset],
+        step_registry: StepCredentialRegistry | None = None,
+    ):
         self.registry = registry
         self.assets = AssetsIndex(assets)
         self._reports: dict[str, Report] = {}
+        self.step_registry = step_registry or StepCredentialRegistry()
+        # Patrol material accepted by this library.
+        self._bands: dict[str, Band] = {}
+        self._interpretations: dict[str, Interpretation] = {}
+        self._contracts: dict[str, PatrolContract] = {}
+
+    # -- patrol material registration --------------------------------
+    def register_band(self, band: Band) -> Band:
+        existing = self._bands.get(band.band_id)
+        if existing is not None:
+            if existing.to_dict() != band.to_dict():
+                raise PatrolError(
+                    f"band {band.band_id!r} already registered with different content"
+                )
+            return existing
+        self._bands[band.band_id] = band
+        return band
+
+    def get_band(self, band_id: str) -> Band:
+        try:
+            return self._bands[band_id]
+        except KeyError as exc:
+            raise KeyError(f"no band {band_id!r}") from exc
+
+    def build_interpretation(
+        self,
+        band_id: str,
+        catalog_revision: str | None = None,
+        credential_revision: str | None = None,
+    ) -> Interpretation:
+        """Interpret ``band_id`` under a designated base + step credential.
+
+        Both revisions default to their registry's *current* version, but a
+        caller may pin an older one explicitly.  The result is cached and
+        keyed by ``(band, catalog_revision, credential_revision)`` so repeated
+        local checks and contract evaluations reuse one feasible relation.
+        """
+        band = self.get_band(band_id)
+        cat_rev = catalog_revision or self.registry.current().revision_id
+        cred_rev = credential_revision or self.step_registry.current()
+        key = make_interp_key(band_id, cat_rev, cred_rev)
+        cached = self._interpretations.get(key)
+        if cached is not None:
+            return cached
+        catalog = self.registry.get(cat_rev)
+        bounds = self.step_registry.bounds_for(cred_rev, band_id)
+        interp = interpret_band(
+            catalog, band, bounds, credential_revision=cred_rev
+        )
+        self._interpretations[key] = interp
+        return interp
+
+    def get_interpretation(self, interp_key: str) -> Interpretation:
+        try:
+            return self._interpretations[interp_key]
+        except KeyError as exc:
+            raise KeyError(f"no interpretation {interp_key!r}") from exc
+
+    def register_contract(self, contract: PatrolContract) -> PatrolContract:
+        """Accept a patrol contract pinned to a specific interpretation."""
+        if contract.interpretation_key not in self._interpretations:
+            raise PatrolError(
+                f"contract {contract.contract_id!r} names interpretation "
+                f"{contract.interpretation_key!r}, which has not been built"
+            )
+        existing = self._contracts.get(contract.contract_id)
+        if existing is not None:
+            if existing.fingerprint() != contract.fingerprint():
+                raise ContractConflictError(
+                    f"contract_id {contract.contract_id!r} already registered "
+                    f"with different content"
+                )
+            return existing
+        self._contracts[contract.contract_id] = contract
+        return contract
+
+    def get_contract(self, contract_id: str) -> PatrolContract:
+        try:
+            return self._contracts[contract_id]
+        except KeyError as exc:
+            raise KeyError(f"no contract {contract_id!r}") from exc
+
+    # -- field-terminal local queries --------------------------------
+    def band_photo_view(
+        self,
+        band_id: str,
+        photo_index: int,
+        catalog_revision: str | None = None,
+        credential_revision: str | None = None,
+    ) -> dict:
+        """Per-photo candidate/transition query (for repeated field checks)."""
+        interp = self.build_interpretation(
+            band_id, catalog_revision, credential_revision
+        )
+        return interp.photo_view(photo_index)
+
+    def check_band_selection(
+        self,
+        band_id: str,
+        selection,
+        catalog_revision: str | None = None,
+        credential_revision: str | None = None,
+    ) -> dict:
+        """Can a local head-to-tail selection be spliced into a full trace?"""
+        interp = self.build_interpretation(
+            band_id, catalog_revision, credential_revision
+        )
+        return interp.check_selection(selection).to_dict()
+
+    def band_view(
+        self,
+        band_id: str,
+        catalog_revision: str | None = None,
+        credential_revision: str | None = None,
+    ) -> dict:
+        interp = self.build_interpretation(
+            band_id, catalog_revision, credential_revision
+        )
+        return interp.band_view()
+
+    def evaluate_contract(self, contract_id: str) -> ContractEvaluation:
+        """Evaluate a pinned contract against its own interpretation."""
+        contract = self.get_contract(contract_id)
+        interp = self.get_interpretation(contract.interpretation_key)
+        zone_eval = interp.evaluate_zone(contract.zone)
+        outcome = classify_outcome(
+            zone_eval.complete, zone_eval.min_hits, zone_eval.max_hits,
+            contract.threshold,
+        )
+        return ContractEvaluation(
+            contract_id=contract_id,
+            interpretation_key=contract.interpretation_key,
+            band_id=contract.band_id,
+            complete=zone_eval.complete,
+            min_hits=zone_eval.min_hits,
+            max_hits=zone_eval.max_hits,
+            threshold=contract.threshold,
+            outcome=outcome,
+            min_trace=zone_eval.min_trace,
+            max_trace=zone_eval.max_trace,
+        )
+
+    def contract_view(self, contract_id: str) -> dict:
+        """Render a contract result, noting whether its base is stale.
+
+        A newer catalogue revision (or newer step credential) does not
+        invalidate the contract: it keeps explaining its pinned photos,
+        versions and feasible relation.  ``stale`` is metadata only.
+        """
+        data = self.evaluate_contract(contract_id).to_dict()
+        contract = self.get_contract(contract_id)
+        current = self.registry.current()
+        cat = self.registry.get(contract.catalog_revision)
+        catalog_stale = (
+            current.route_id == cat.route_id
+            and current.revision_id != contract.catalog_revision
+        )
+        current_cred = (
+            self.step_registry.current() if self.step_registry.all_revisions() else None
+        )
+        credential_stale = (
+            current_cred is not None and current_cred != contract.credential_revision
+        )
+        data["catalog_revision"] = contract.catalog_revision
+        data["credential_revision"] = contract.credential_revision
+        data["catalog_stale"] = catalog_stale
+        data["credential_stale"] = credential_stale
+        data["current_catalog_revision"] = self.registry.current().revision_id
+        data["current_credential_revision"] = current_cred
+        return data
 
     # -- report construction -----------------------------------------
     def resolve_and_inspect(self, job: dict, report_id: str) -> Report:

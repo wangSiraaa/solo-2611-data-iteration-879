@@ -1,0 +1,9 @@
+{
+  "revision": "d1",
+  "route_id": "D",
+  "length": 20,
+  "sections": [
+    {"section_id": "S1", "physical_start": 0, "physical_end": 10, "label_start": 0},
+    {"section_id": "S2", "physical_start": 10, "physical_end": 20, "label_start": 0}
+  ]
+}

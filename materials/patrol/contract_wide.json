@@ -1,0 +1,8 @@
+{
+  "contract_id": "C1_wide",
+  "band_id": "B",
+  "catalog_revision": "d1",
+  "credential_revision": "c1",
+  "zone": [{"start": 2, "end": 5}],
+  "threshold": 1
+}

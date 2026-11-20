@@ -130,3 +130,126 @@ Measured by `bench_scale.py`:
 No path optimisation, no measurement adjustment/least-squares, no inference
 of missing positions. Nothing beyond the one explicit base correction is
 changed.
+
+---
+
+# Patrol photo-band interpretation (`patrol_interpretation.py`)
+
+The catalogue resolves *one* label to a set of candidate physical readings.
+A patrol band is an **ordered sequence** of photographed mileage labels, and
+the question is whether the *whole band* can be explained — not whether each
+photo could individually be somewhere.  The new module layers this on top of
+an existing `RouteCatalog`; it never changes how labels resolve.
+
+## What a legal interpretation is
+
+For a **designated base-marker revision** `catalog_revision` and a
+**designated step-credential revision** `credential_revision`:
+
+* every photo picks exactly one real catalogue candidate
+  `(section_id, physical)` — no invented positions;
+* every adjacent pair satisfies its step window `[min_step, max_step]`,
+  **inclusive of both bounds**, and the displacement is `>= 0` (forward-only;
+  standing still is allowed when `min_step == 0`).
+
+The feasible relation is built as a layered graph by a forward pass from the
+head and a backward pass from the tail.  A candidate/transition survives only
+if it lies on **some** complete interpretation.  This is a per-photo query
+(`photo_view`) and a head-to-tail splice test for a named local selection
+(`check_selection`).
+
+## Zero candidates vs. a broken chain
+
+These are reported distinctly, never collapsed:
+
+| situation | `band.reason` | per-photo `status` |
+|-----------|---------------|--------------------|
+| some photo has no real candidate | `no_candidates` | `no_candidates` |
+| every photo has candidates but no full path exists | `disconnected` | `unreachable` / `dead_end` |
+| a full path exists | `None` | `viable` |
+
+`check_selection` reasons: `ok`, `no_complete_path`, `photo_out_of_range`,
+`no_candidates`, `not_a_candidate`, `unreachable_from_head`,
+`cannot_reach_tail`, `cannot_connect`.
+
+## Zones, contracts and outcomes
+
+A `Zone` is a union of **non-overlapping physical half-open intervals**
+`[start, end)`; overlapping registration is rejected, touching intervals are
+merged.  A contract pins `(band_id, catalog_revision, credential_revision)`,
+a zone, and a threshold.
+
+`evaluate_zone` returns, over **all** legal interpretations:
+
+* `min_hits` / `max_hits` — the fewest / most photos whose chosen point lands
+  in the zone;
+* one witness `min_trace` and one `max_trace` (full per-photo candidate
+  choices), each verified legal by `verify_trace`.
+
+`classify_outcome` then decides:
+
+| condition | outcome |
+|-----------|---------|
+| no complete interpretation | `contradiction` |
+| `min_hits >= threshold` | `confirmed` |
+| `max_hits >= threshold` (only) | `manual_review` |
+| neither | `not_met` |
+
+Crucially, min/max are computed by **dynamic programming** over the layered
+DAG (`O(photos * candidates^2)`), so the number of complete traces — which
+grows exponentially — is never enumerated.  A single photo's possible region
+therefore can never stand in for the band's association.
+
+## Worked example (the task's case)
+
+Route: two physical segments `[0,10)` and `[10,20)`, both labelled from 0.
+Photos 2 then 4; step exactly 2.
+
+* candidates: photo 2 → `{S1@2, S2@12}`, photo 4 → `{S1@4, S2@14}`.
+* exact displacement 2 leaves only `(2,4)` or `(12,14)`.
+* zone `[2,3) ∪ [14,15)`: every path hits exactly once → `min=max=1` →
+  threshold 1 **confirmed**.
+* zone `[2,5)`: `(12,14)` hits 0, `(2,4)` hits 2 → range `0..2` → threshold 1
+  **manual_review**.
+* revise the credential so the step is exactly 12: only `(2,14)` remains, and
+  zone `[2,3) ∪ [14,15)` hits twice → threshold 2 **confirmed**.
+
+Demoed in `materials/patrol` (`python3 solution/run_demo.py --materials
+materials/patrol`), including a late mid-band credential revision and a
+reopen of a file-backed DB.
+
+## Versioning, persistence, and why old contracts survive
+
+Step credentials live in their own `StepCredentialRegistry`, mirroring
+`CatalogRegistry`: `revise_transition` copies every other band/boundary and
+changes exactly one.  An interpretation is keyed by
+`band|catalog_revision|credential_revision`; a late revision of an
+intermediate credential or of a base marker yields a **new** interpretation
+while the old one — and any contract pinned to it — keeps explaining its
+original photos, versions and feasible relation.  `contract_view` reports
+`catalog_stale` / `credential_stale` as metadata only.
+
+Everything is persisted in a separate patrol schema (`patrol_band`,
+`step_credential_*`, `patrol_interpretation`, `patrol_interp_*`,
+`patrol_contract*`), so a reopened DB can answer `check_selection`,
+`evaluate_contract`, and ship a fresh witness without replaying operations.
+Several contracts read the **same** interpretation independently.
+
+## Scale / cost
+
+`bench_scale_patrol.py` — a **200-photo** band with **20 candidates/photo**
+and a capped count already `>= 1e18` complete interpretations:
+
+* build the relation once: ~0.13 s (layered forward/backward reachability);
+* zone min/max: ~2.5 ms/zone (DP, independent of the trace count);
+* local head-to-tail splice check: ~2 µs (reuses the built relation);
+* contract zone re-evaluation (rotating zones): DP only, no rebuild.
+
+Memory is `O(photos * candidates^2)` edges, **not** `O(#traces)` — so the
+field terminal can hammer local checks and the contract side can keep
+swapping zones without an exponential blow-up.
+
+```bash
+python3 solution/bench_scale_patrol.py
+```
+

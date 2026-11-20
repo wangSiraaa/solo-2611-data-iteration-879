@@ -1,0 +1,10 @@
+{"op": "define_band", "file": "band.json"}
+{"op": "define_step_credentials", "file": "step_credentials_c1.json"}
+{"op": "open_contract", "file": "contract_c1.json"}
+{"op": "open_contract", "file": "contract_wide.json"}
+{"op": "query_band", "band_id": "B", "credential_revision": "c1", "selections": [[{"photo": 0, "candidate": ["S2", 12]}, {"photo": 1, "candidate": ["S1", 4]}], [{"photo": 0, "candidate": ["S1", 2]}, {"photo": 1, "candidate": ["S1", 4]}]]}
+{"op": "revise_step_credential", "file": "step_credentials_c2.json"}
+{"op": "open_contract", "file": "contract_c2.json"}
+{"op": "evaluate_contract", "contract_id": "C1"}
+{"op": "evaluate_contract", "contract_id": "C1_wide"}
+{"op": "evaluate_contract", "contract_id": "C2"}

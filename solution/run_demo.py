@@ -35,6 +35,21 @@ from inspection_library import (
     persist_assets,
     persist_report,
 )
+from patrol_interpretation import (
+    Band,
+    PatrolContract,
+    StepBound,
+    Zone,
+    ensure_patrol_schema,
+    load_all_contracts,
+    load_all_interpretations,
+    load_bands,
+    load_step_credential_registry,
+    persist_band,
+    persist_contract,
+    persist_interpretation,
+    persist_step_credential_revision,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +85,12 @@ def _frac(value: Fraction) -> str:
 
 def _fmt_interval(iv) -> str:
     return f"[{_frac(iv.start)}, {_frac(iv.end)})"
+
+
+def _trace_str(trace) -> str:
+    return " -> ".join(
+        f"{c['section_id']}@{_dbfrac(c['physical'])}" for c in trace
+    )
 
 
 def _dbfrac(text: str) -> str:
@@ -190,7 +211,14 @@ class Application:
 
     # Ops that mutate durable state; these are logged for resume. Read-only
     # ops are always executed so a reopened DB can still render them.
-    MUTATING = {"resolve_and_inspect", "revise_chainage"}
+    MUTATING = {
+        "resolve_and_inspect",
+        "revise_chainage",
+        "define_band",
+        "define_step_credentials",
+        "revise_step_credential",
+        "open_contract",
+    }
 
     def apply(self, op: dict) -> None:
         kind = op.get("op")
@@ -205,10 +233,155 @@ class Application:
             self._op_read_report(op)
         elif kind == "resolve_points":
             self._op_resolve_points(op)
+        elif kind == "define_band":
+            self._op_define_band(op)
+        elif kind == "define_step_credentials":
+            self._op_define_step_credentials(op)
+        elif kind == "revise_step_credential":
+            self._op_revise_step_credential(op)
+        elif kind == "open_contract":
+            self._op_open_contract(op)
+        elif kind == "evaluate_contract":
+            self._op_evaluate_contract(op)
+        elif kind == "query_band":
+            self._op_query_band(op)
         else:
             raise ValueError(f"unknown operation {kind!r}")
         if kind in self.MUTATING:
             self._mark_op_done(op)
+
+    # -- patrol operations -------------------------------------------
+    def _interpret(self, band_id: str, cat_rev, cred_rev):
+        interp = self.lib.build_interpretation(band_id, cat_rev, cred_rev)
+        persist_interpretation(self.conn, interp)
+        return interp
+
+    def _op_define_band(self, op: dict) -> None:
+        payload = _read_json(self._path(op["file"]))
+        band = Band.from_dict(payload)
+        print(f"\n[define_band] {band.band_id}: {band.photo_count} photos "
+              f"labels {[_frac(x) for x in band.labels]}")
+        self.lib.register_band(band)
+        persist_band(self.conn, band)
+
+    def _op_define_step_credentials(self, op: dict) -> None:
+        payload = _read_json(self._path(op["file"]))
+        revision_id = str(payload["revision"])
+        by_band = {
+            str(band_id): [tuple(pair) for pair in pairs]
+            for band_id, pairs in payload["bands"].items()
+        }
+        print(f"\n[define_step_credentials] revision {revision_id}")
+        self.lib.step_registry.add(revision_id, by_band)
+        persist_step_credential_revision(self.conn, revision_id, by_band)
+        for band_id, bounds in by_band.items():
+            shown = ", ".join(f"[{_frac(Fraction(lo))}, {_frac(Fraction(hi))}]"
+                              for lo, hi in bounds)
+            print(f"  {band_id}: step windows {shown}")
+
+    def _op_revise_step_credential(self, op: dict) -> None:
+        payload = _read_json(self._path(op["file"]))
+        revision_id = str(payload["revision"])
+        band_id = str(payload["band_id"])
+        index = int(payload["index"])
+        print(f"\n[revise_step_credential] revision {revision_id} "
+              f"{band_id} transition {index} -> "
+              f"[{payload['min_step']}, {payload['max_step']}]")
+        base = str(payload.get("base_revision") or self.lib.step_registry.current())
+        self.lib.step_registry.revise_transition(
+            revision_id, band_id, index,
+            payload["min_step"], payload["max_step"], base_revision=base,
+        )
+        persist_step_credential_revision(
+            self.conn, revision_id,
+            self.lib.step_registry.get(revision_id),
+        )
+        print(f"  now {len(self.lib.step_registry.all_revisions())} step "
+              f"credential revisions; current is {revision_id}")
+
+    def _op_open_contract(self, op: dict) -> None:
+        payload = _read_json(self._path(op["file"]))
+        contract = self._contract_from_payload(payload)
+        interp = self._interpret(
+            contract.band_id, contract.catalog_revision,
+            contract.credential_revision,
+        )
+        if not interp.complete:
+            print(f"\n[open_contract] {contract.contract_id}: interpretation "
+                  f"{interp.interpretation_key} has no complete trace "
+                  f"({interp.reason}) -- still registered for auditing")
+        else:
+            print(f"\n[open_contract] {contract.contract_id} band {contract.band_id} "
+                  f"@ catalog {contract.catalog_revision} / credential "
+                  f"{contract.credential_revision}, threshold {contract.threshold}")
+        self.lib.register_contract(contract)
+        persist_contract(self.conn, contract)
+        self._print_contract(contract.contract_id)
+
+    def _contract_from_payload(self, payload: dict) -> PatrolContract:
+        band_id = str(payload["band_id"])
+        cat_rev = str(payload.get("catalog_revision")
+                      or self.registry.current().revision_id)
+        cred_rev = str(payload.get("credential_revision")
+                       or self.lib.step_registry.current())
+        zone = Zone([(iv["start"], iv["end"]) for iv in payload["zone"]])
+        return PatrolContract(
+            contract_id=str(payload["contract_id"]),
+            band_id=band_id,
+            catalog_revision=cat_rev,
+            credential_revision=cred_rev,
+            zone=zone,
+            threshold=int(payload["threshold"]),
+        )
+
+    def _op_evaluate_contract(self, op: dict) -> None:
+        contract_id = str(op["contract_id"])
+        print(f"\n[evaluate_contract] {contract_id}")
+        self._print_contract(contract_id)
+
+    def _op_query_band(self, op: dict) -> None:
+        band_id = str(op["band_id"])
+        interp = self._interpret(
+            band_id, op.get("catalog_revision"), op.get("credential_revision")
+        )
+        print(f"\n[query_band] {band_id} @ {interp.interpretation_key} "
+              f"complete={interp.complete}")
+        for i in range(interp.photo_count):
+            view = interp.photo_view(i)
+            viable = view["viable_candidates"]
+            print(f"  photo {i} label {_dbfrac(view['label'])}: "
+                  f"{view['status']} ({len(viable)}/{len(view['candidates'])} viable)")
+        for group in op.get("selections", []):
+            choice = {int(item["photo"]): tuple(item["candidate"])
+                      for item in group}
+            result = interp.check_selection(choice).to_dict()
+            shown = ", ".join(
+                f"p{int(item['photo'])}={item['candidate']}" for item in group
+            )
+            print(f"  splice [{shown}]: ok={result['ok']} "
+                  f"reason={result['reason']}")
+
+    def _print_contract(self, contract_id: str) -> None:
+        view = self.lib.contract_view(contract_id)
+        zone = ", ".join(
+            f"[{_dbfrac(iv['start'])}, {_dbfrac(iv['end'])})"
+            for iv in self.lib.get_contract(contract_id).zone.to_list()
+        )
+        print(f"  zone: {zone}   threshold: {view['threshold']}")
+        if not view["complete"]:
+            print("  outcome: CONTRADICTION (no complete trace)")
+        else:
+            print(f"  min_hits={view['min_hits']} max_hits={view['max_hits']} "
+                  f"-> {view['outcome']}")
+            min_trace = view["min_trace"]
+            max_trace = view["max_trace"]
+            if min_trace is not None:
+                print("  min trace: " + _trace_str(min_trace))
+            if max_trace is not None and max_trace != min_trace:
+                print("  max trace: " + _trace_str(max_trace))
+        print(f"  pinned catalog={view['catalog_revision']} "
+              f"(stale={view['catalog_stale']}), credential="
+              f"{view['credential_revision']} (stale={view['credential_stale']})")
 
     # -- operations ---------------------------------------------------
     def _op_resolve_and_inspect(self, op: dict) -> None:
@@ -285,6 +458,7 @@ class Application:
 def bootstrap(materials_dir: str, db_path: str):
     conn = open_db(db_path)
     ensure_inspection_schema(conn)
+    ensure_patrol_schema(conn)
 
     route = _read_json(os.path.join(materials_dir, "route.json"))
     catalog = RouteCatalog.from_dict(route)
@@ -301,10 +475,18 @@ def bootstrap(materials_dir: str, db_path: str):
     if not stored_assets:
         stored_assets = assets
 
-    lib = InspectionLibrary(registry, stored_assets)
+    step_registry = load_step_credential_registry(conn)
+    lib = InspectionLibrary(registry, stored_assets, step_registry=step_registry)
     # Reload any previously persisted reports (durability across runs).
     for rid, rep in load_all_reports(conn).items():
         lib._reports[rid] = rep
+    # Reload patrol material so a reopened DB can answer without replaying.
+    for band in load_bands(conn).values():
+        lib._bands[band.band_id] = band
+    for key, interp in load_all_interpretations(conn).items():
+        lib._interpretations[key] = interp
+    for contract in load_all_contracts(conn).values():
+        lib._contracts[contract.contract_id] = contract
 
     return conn, registry, lib
 
@@ -330,10 +512,16 @@ def run(materials_dir: str, db_path: str) -> None:
     for op in ops:
         app.apply(op)
 
-    print("\n" + "=" * 78)
-    print("Summary: P2 base-label correction and real facility change")
-    print("=" * 78)
-    _summarize_revision_effect(lib, registry)
+    if lib._reports:
+        print("\n" + "=" * 78)
+        print("Summary: P2 base-label correction and real facility change")
+        print("=" * 78)
+        _summarize_revision_effect(lib, registry)
+    if lib._contracts:
+        print("\n" + "=" * 78)
+        print("Summary: patrol contracts")
+        print("=" * 78)
+        _summarize_contracts(lib)
 
 
 def _summarize_revision_effect(lib: InspectionLibrary, registry: CatalogRegistry) -> None:
@@ -357,6 +545,26 @@ def _summarize_revision_effect(lib: InspectionLibrary, registry: CatalogRegistry
                 f"    {rep.report_id} @ {rep.catalog_revision}: labels {labels} "
                 f"-> coverage {cov} -> facilities [{facs}]"
             )
+
+
+def _summarize_contracts(lib: InspectionLibrary) -> None:
+    for contract_id in sorted(lib._contracts):
+        view = lib.contract_view(contract_id)
+        if not view["complete"]:
+            result = "CONTRADICTION (no complete trace)"
+        else:
+            result = (
+                f"min={view['min_hits']} max={view['max_hits']} "
+                f"threshold={view['threshold']} -> {view['outcome']}"
+            )
+        print(
+            f"  {contract_id} band {view['band_id']} @ "
+            f"{view['catalog_revision']}/{view['credential_revision']}: {result}"
+        )
+        if view["min_trace"] is not None:
+            print(f"    min path: {_trace_str(view['min_trace'])}")
+        if view["max_trace"] is not None:
+            print(f"    max path: {_trace_str(view['max_trace'])}")
 
 
 def main(argv=None) -> int:
